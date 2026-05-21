@@ -3,9 +3,11 @@
   "version": "1.0.0",
   "main": "market.js",
   "scripts": {
-    "start": "node market.js"
+    "start": "node market.js",
+    "build": "node -c market.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.106.1",
     "discord.js": "^14.0.0",
     "dotenv": "^16.0.0"
   }

@@ -4,9 +4,6 @@ const {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   SlashCommandBuilder,
   PermissionsBitField,
   REST,
@@ -15,44 +12,28 @@ const {
   ActivityType
 } = require('discord.js');
 
-const fs   = require('fs');
+const { createClient } = require('@supabase/supabase-js');
 const http = require('http');
 
-// ✅ Keep-alive server
+// Keep-alive server
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => { res.end('Market bot alive!'); }).listen(PORT);
 
-// ✅ Error handling
+// Error handling
 process.on('unhandledRejection', console.error);
 process.on('uncaughtException', console.error);
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const GUILD_ID        = process.env.GUILD_ID;
 const BUY_LOG_CHANNEL = process.env.BUY_LOG_CHANNEL;
-const REVIEW_CHANNEL  = process.env.REVIEW_CHANNEL; // channel where reviews get posted publicly
+const REVIEW_CHANNEL  = process.env.REVIEW_CHANNEL;
 const COLOR           = 0x6cc5ff;
 
-// ─── JSON DATABASE ────────────────────────────────────────────────────────────
-const DB         = './data';
-const PRODUCTS_F = `${DB}/products.json`;
-const USERS_F    = `${DB}/users.json`;
-const LOGS_F     = `${DB}/logs.json`;
-const REVIEWS_F  = `${DB}/reviews.json`;
-
-for (const dir of [DB]) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-for (const [file, def] of [
-  [PRODUCTS_F, '{}'],
-  [USERS_F, '{}'],
-  [LOGS_F, '[]'],
-  [REVIEWS_F, '{}']
-]) {
-  if (!fs.existsSync(file)) fs.writeFileSync(file, def);
-}
-
-const readJSON  = (f) => JSON.parse(fs.readFileSync(f, 'utf8'));
-const writeJSON = (f, d) => fs.writeFileSync(f, JSON.stringify(d, null, 2));
+// ─── SUPABASE ─────────────────────────────────────────────────────────────────
+const supabase = createClient(
+  process.env.VITE_SUPABASE_URL,
+  process.env.VITE_SUPABASE_ANON_KEY
+);
 
 // ─── ROBLOX HELPERS ───────────────────────────────────────────────────────────
 async function getRobloxUser(username) {
@@ -178,13 +159,13 @@ const commands = [
 
 // ─── BOT READY ────────────────────────────────────────────────────────────────
 client.once(Events.ClientReady, async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
+  console.log(`Logged in as ${client.user.tag}`);
   client.user.setActivity('the market', { type: ActivityType.Watching });
 
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
   try {
     await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body: commands });
-    console.log('✅ Slash commands registered.');
+    console.log('Slash commands registered.');
   } catch (err) {
     console.error('Failed to register commands:', err);
   }
@@ -204,21 +185,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const robloxUser = await getRobloxUser(username);
 
     if (!robloxUser) {
-      return interaction.editReply({ content: '❌ Roblox username not found. Please check and try again.' });
+      return interaction.editReply({ content: 'Roblox username not found. Please check and try again.' });
     }
 
-    const code  = generateCode();
-    const users = readJSON(USERS_F);
+    const code = generateCode();
 
-    users[interaction.user.id] = {
-      ...users[interaction.user.id],
-      pendingRoblox: { id: robloxUser.id, username: robloxUser.name, code }
-    };
-    writeJSON(USERS_F, users);
+    const { error } = await supabase
+      .from('users')
+      .upsert({
+        id: interaction.user.id,
+        pending_roblox_id: String(robloxUser.id),
+        pending_roblox_username: robloxUser.name,
+        pending_code: code,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'id' });
+
+    if (error) {
+      console.error('Supabase error (linkroblox):', error);
+      return interaction.editReply({ content: 'An error occurred. Please try again.' });
+    }
 
     const embed = new EmbedBuilder()
       .setColor(COLOR)
-      .setTitle('🔗 Link Your Roblox Account')
+      .setTitle('Link Your Roblox Account')
       .setDescription(
         `**Step 1:** Copy the code below\n` +
         `**Step 2:** Go to your [Roblox profile](https://www.roblox.com/users/${robloxUser.id}/profile) and paste it in your **bio/description**\n` +
@@ -238,35 +227,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (commandName === 'verify') {
     await interaction.deferReply({ ephemeral: true });
 
-    const users = readJSON(USERS_F);
-    const user  = users[interaction.user.id];
+    const { data: user } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', interaction.user.id)
+      .maybeSingle();
 
-    if (!user?.pendingRoblox) {
-      return interaction.editReply({ content: '❌ No pending verification. Run `/linkroblox` first.' });
+    if (!user?.pending_roblox_id) {
+      return interaction.editReply({ content: 'No pending verification. Run `/linkroblox` first.' });
     }
 
-    const { id, username, code } = user.pendingRoblox;
+    const { pending_roblox_id: id, pending_roblox_username: username, pending_code: code } = user;
     const bio = await getRobloxBio(id);
 
     if (!bio.includes(code)) {
       return interaction.editReply({
-        content: `❌ Code \`${code}\` not found in your Roblox bio. Make sure you saved it, then try again.`
+        content: `Code \`${code}\` not found in your Roblox bio. Make sure you saved it, then try again.`
       });
     }
 
-    users[interaction.user.id] = {
-      ...user,
-      roblox: { id, username },
-      pendingRoblox: null,
-      purchases: user.purchases || []
-    };
-    writeJSON(USERS_F, users);
+    const { error } = await supabase
+      .from('users')
+      .update({
+        roblox_id: id,
+        roblox_username: username,
+        pending_roblox_id: null,
+        pending_roblox_username: null,
+        pending_code: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', interaction.user.id);
+
+    if (error) {
+      console.error('Supabase error (verify):', error);
+      return interaction.editReply({ content: 'An error occurred. Please try again.' });
+    }
 
     const avatar = await getRobloxAvatar(id);
 
     const embed = new EmbedBuilder()
       .setColor(0x57f287)
-      .setTitle('✅ Roblox Account Linked!')
+      .setTitle('Roblox Account Linked!')
       .setDescription(`Your Discord is now linked to **${username}**.\nYou can remove the code from your bio now.`);
 
     if (avatar) embed.setThumbnail(avatar);
@@ -284,28 +285,38 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const gamepassId  = interaction.options.getString('gamepass_id');
     const file        = interaction.options.getAttachment('file');
     const thumbnail   = interaction.options.getAttachment('thumbnail');
-    const products    = readJSON(PRODUCTS_F);
 
-    if (products[name]) {
-      return interaction.editReply({ content: `❌ A product named **${name}** already exists.` });
+    const { data: existing } = await supabase
+      .from('products')
+      .select('name')
+      .eq('name', name)
+      .maybeSingle();
+
+    if (existing) {
+      return interaction.editReply({ content: `A product named **${name}** already exists.` });
     }
 
-    products[name] = {
-      name,
-      description,
-      price,
-      gamepassId,
-      fileUrl: file.url,
-      fileName: file.name,
-      thumbnailUrl: thumbnail?.url || null,
-      addedBy: interaction.user.id,
-      addedAt: new Date().toISOString()
-    };
-    writeJSON(PRODUCTS_F, products);
+    const { error } = await supabase
+      .from('products')
+      .insert({
+        name,
+        description,
+        price,
+        gamepass_id: gamepassId,
+        file_url: file.url,
+        file_name: file.name,
+        thumbnail_url: thumbnail?.url || null,
+        added_by: interaction.user.id
+      });
+
+    if (error) {
+      console.error('Supabase error (addproduct):', error);
+      return interaction.editReply({ content: 'An error occurred. Please try again.' });
+    }
 
     const embed = new EmbedBuilder()
       .setColor(0x57f287)
-      .setTitle('✅ Product Added')
+      .setTitle('Product Added')
       .addFields(
         { name: 'Name', value: name, inline: true },
         { name: 'Price', value: price, inline: true },
@@ -322,98 +333,123 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (commandName === 'removeproduct') {
     await interaction.deferReply({ ephemeral: true });
 
-    const name     = interaction.options.getString('name').toLowerCase().trim();
-    const products = readJSON(PRODUCTS_F);
+    const name = interaction.options.getString('name').toLowerCase().trim();
 
-    if (!products[name]) {
-      return interaction.editReply({ content: `❌ No product named **${name}** found.` });
+    const { error, count } = await supabase
+      .from('products')
+      .delete({ count: 'exact' })
+      .eq('name', name);
+
+    if (error) {
+      console.error('Supabase error (removeproduct):', error);
+      return interaction.editReply({ content: 'An error occurred. Please try again.' });
     }
 
-    delete products[name];
-    writeJSON(PRODUCTS_F, products);
+    if (count === 0) {
+      return interaction.editReply({ content: `No product named **${name}** found.` });
+    }
 
-    await interaction.editReply({ content: `✅ Product **${name}** removed.` });
+    await interaction.editReply({ content: `Product **${name}** removed.` });
   }
 
   // ── /listproducts ─────────────────────────────────────────────────────────────
   if (commandName === 'listproducts') {
     await interaction.deferReply();
 
-    const products = readJSON(PRODUCTS_F);
-    const reviews  = readJSON(REVIEWS_F);
-    const list     = Object.values(products);
+    const { data: products } = await supabase
+      .from('products')
+      .select('*');
 
-    if (list.length === 0) {
-      return interaction.editReply({ content: '📦 No products available yet.' });
+    if (!products || products.length === 0) {
+      return interaction.editReply({ content: 'No products available yet.' });
     }
 
-    const embeds = list.map(p => {
-      const productReviews = reviews[p.name] || [];
-      const avgRating      = productReviews.length
-        ? (productReviews.reduce((a, r) => a + r.stars, 0) / productReviews.length).toFixed(1)
+    const embeds = [];
+    for (const p of products.slice(0, 10)) {
+      const { data: productReviews } = await supabase
+        .from('reviews')
+        .select('stars')
+        .eq('product_name', p.name);
+
+      const reviews = productReviews || [];
+      const avgRating = reviews.length
+        ? (reviews.reduce((a, r) => a + r.stars, 0) / reviews.length).toFixed(1)
         : null;
 
       const embed = new EmbedBuilder()
         .setColor(COLOR)
-        .setTitle(`📦 ${p.name}`)
+        .setTitle(`${p.name}`)
         .setDescription(p.description)
         .addFields(
           { name: 'Price', value: p.price, inline: true },
           {
             name: 'Rating',
-            value: avgRating ? `${starDisplay(Math.round(Number(avgRating)))} (${avgRating}/5 — ${productReviews.length} reviews)` : 'No reviews yet',
+            value: avgRating ? `${starDisplay(Math.round(Number(avgRating)))} (${avgRating}/5 — ${reviews.length} reviews)` : 'No reviews yet',
             inline: true
           },
-          { name: 'Gamepass ID', value: p.gamepassId, inline: true }
+          { name: 'Gamepass ID', value: p.gamepass_id, inline: true }
         )
         .setFooter({ text: `Use /buy ${p.name} to purchase` });
 
-      if (p.thumbnailUrl) embed.setThumbnail(p.thumbnailUrl);
-      return embed;
-    });
+      if (p.thumbnail_url) embed.setThumbnail(p.thumbnail_url);
+      embeds.push(embed);
+    }
 
-    await interaction.editReply({ embeds: embeds.slice(0, 10) });
+    await interaction.editReply({ embeds });
   }
 
   // ── /buy ──────────────────────────────────────────────────────────────────────
   if (commandName === 'buy') {
     await interaction.deferReply({ ephemeral: true });
 
-    const name     = interaction.options.getString('productname').toLowerCase().trim();
-    const products = readJSON(PRODUCTS_F);
-    const users    = readJSON(USERS_F);
-    const logs     = readJSON(LOGS_F);
-    const product  = products[name];
+    const name = interaction.options.getString('productname').toLowerCase().trim();
+
+    const { data: product } = await supabase
+      .from('products')
+      .select('*')
+      .eq('name', name)
+      .maybeSingle();
 
     if (!product) {
       return interaction.editReply({
-        content: `❌ No product named **${name}** found. Use \`/listproducts\` to see available products.`
+        content: `No product named **${name}** found. Use \`/listproducts\` to see available products.`
       });
     }
 
-    const userData = users[interaction.user.id];
-    if (!userData?.roblox) {
+    const { data: userData } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', interaction.user.id)
+      .maybeSingle();
+
+    if (!userData?.roblox_id) {
       return interaction.editReply({
-        content: '❌ You need to link your Roblox account first.\nUse `/linkroblox` to get started.'
+        content: 'You need to link your Roblox account first.\nUse `/linkroblox` to get started.'
       });
     }
 
     // Check if already purchased
-    const alreadyBought = logs.find(l => l.userId === interaction.user.id && l.product === name);
-    if (alreadyBought) {
+    const { data: existingPurchase } = await supabase
+      .from('purchase_logs')
+      .select('id')
+      .eq('discord_user_id', interaction.user.id)
+      .eq('product_name', name)
+      .maybeSingle();
+
+    if (existingPurchase) {
       return interaction.editReply({
-        content: `✅ You already purchased **${name}**! Use \`/retrieve ${name}\` to get the file again.`
+        content: `You already purchased **${name}**! Use \`/retrieve ${name}\` to get the file again.`
       });
     }
 
     // Check gamepass ownership
-    const owns = await ownsGamepass(userData.roblox.id, product.gamepassId);
+    const owns = await ownsGamepass(userData.roblox_id, product.gamepass_id);
     if (!owns) {
       return interaction.editReply({
         content:
-          `❌ You don't own the required gamepass for **${name}**.\n` +
+          `You don't own the required gamepass for **${name}**.\n` +
           `Purchase it on Roblox first, then try again.\n\n` +
-          `🔗 [Buy Gamepass](https://www.roblox.com/game-pass/${product.gamepassId})`
+          `[Buy Gamepass](https://www.roblox.com/game-pass/${product.gamepass_id})`
       });
     }
 
@@ -421,7 +457,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       const dmEmbed = new EmbedBuilder()
         .setColor(COLOR)
-        .setTitle('🎉 Thank you for your purchase!')
+        .setTitle('Thank you for your purchase!')
         .setDescription(
           `Thank you for purchasing **${name}**. You can download it below.\n\n` +
           `If you have any issues, use \`/retrieve ${name}\` or contact support.`
@@ -433,41 +469,39 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.user.send({
         embeds: [dmEmbed],
-        files: [{ attachment: product.fileUrl, name: product.fileName }]
+        files: [{ attachment: product.file_url, name: product.file_name }]
       });
     } catch {
       return interaction.editReply({
-        content: `❌ Couldn't DM you the file. Please open your DMs and use \`/retrieve ${name}\` to try again.`
+        content: `Couldn't DM you the file. Please open your DMs and use \`/retrieve ${name}\` to try again.`
       });
     }
 
     // Log the purchase
-    const log = {
-      userId: interaction.user.id,
-      userTag: interaction.user.username,
-      robloxUsername: userData.roblox.username,
-      robloxId: userData.roblox.id,
-      product: name,
-      price: product.price,
-      purchasedAt: new Date().toISOString()
-    };
-    logs.push(log);
-    writeJSON(LOGS_F, logs);
+    const { error: logError } = await supabase
+      .from('purchase_logs')
+      .insert({
+        discord_user_id: interaction.user.id,
+        discord_username: interaction.user.username,
+        roblox_username: userData.roblox_username,
+        roblox_id: userData.roblox_id,
+        product_name: name,
+        price: product.price
+      });
 
-    if (!userData.purchases) userData.purchases = [];
-    userData.purchases.push(name);
-    users[interaction.user.id] = userData;
-    writeJSON(USERS_F, users);
+    if (logError) {
+      console.error('Supabase error (buy log):', logError);
+    }
 
     // Send to buy log channel
     const logChannel = interaction.guild.channels.cache.get(BUY_LOG_CHANNEL);
     if (logChannel) {
       const logEmbed = new EmbedBuilder()
         .setColor(0x57f287)
-        .setTitle('💸 New Purchase')
+        .setTitle('New Purchase')
         .addFields(
           { name: 'Discord', value: `<@${interaction.user.id}> (${interaction.user.username})`, inline: true },
-          { name: 'Roblox', value: `${userData.roblox.username} (${userData.roblox.id})`, inline: true },
+          { name: 'Roblox', value: `${userData.roblox_username} (${userData.roblox_id})`, inline: true },
           { name: 'Product', value: name, inline: true },
           { name: 'Price', value: product.price, inline: true },
           { name: 'Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
@@ -476,7 +510,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     await interaction.editReply({
-      content: `✅ Purchase successful! Check your DMs for **${name}**. Leave a review with \`/review\`!`
+      content: `Purchase successful! Check your DMs for **${name}**. Leave a review with \`/review\`!`
     });
   }
 
@@ -484,36 +518,45 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (commandName === 'retrieve') {
     await interaction.deferReply({ ephemeral: true });
 
-    const name     = interaction.options.getString('productname').toLowerCase().trim();
-    const products = readJSON(PRODUCTS_F);
-    const logs     = readJSON(LOGS_F);
-    const product  = products[name];
+    const name = interaction.options.getString('productname').toLowerCase().trim();
+
+    const { data: product } = await supabase
+      .from('products')
+      .select('*')
+      .eq('name', name)
+      .maybeSingle();
 
     if (!product) {
-      return interaction.editReply({ content: `❌ No product named **${name}** found.` });
+      return interaction.editReply({ content: `No product named **${name}** found.` });
     }
 
-    const purchased = logs.find(l => l.userId === interaction.user.id && l.product === name);
+    const { data: purchased } = await supabase
+      .from('purchase_logs')
+      .select('id')
+      .eq('discord_user_id', interaction.user.id)
+      .eq('product_name', name)
+      .maybeSingle();
+
     if (!purchased) {
       return interaction.editReply({
-        content: `❌ You haven't purchased **${name}** yet. Use \`/buy ${name}\` to buy it.`
+        content: `You haven't purchased **${name}** yet. Use \`/buy ${name}\` to buy it.`
       });
     }
 
     try {
       const dmEmbed = new EmbedBuilder()
         .setColor(COLOR)
-        .setTitle('📦 Here is your product!')
+        .setTitle('Here is your product!')
         .setDescription(`Here's your copy of **${name}**. Enjoy!`);
 
       await interaction.user.send({
         embeds: [dmEmbed],
-        files: [{ attachment: product.fileUrl, name: product.fileName }]
+        files: [{ attachment: product.file_url, name: product.file_name }]
       });
 
-      await interaction.editReply({ content: '✅ File sent to your DMs!' });
+      await interaction.editReply({ content: 'File sent to your DMs!' });
     } catch {
-      await interaction.editReply({ content: '❌ Couldn\'t DM you. Please open your DMs and try again.' });
+      await interaction.editReply({ content: 'Couldn\'t DM you. Please open your DMs and try again.' });
     }
   }
 
@@ -524,34 +567,45 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const name     = interaction.options.getString('productname').toLowerCase().trim();
     const stars    = interaction.options.getInteger('stars');
     const feedback = interaction.options.getString('feedback');
-    const logs     = readJSON(LOGS_F);
-    const reviews  = readJSON(REVIEWS_F);
-    const users    = readJSON(USERS_F);
 
-    const purchased = logs.find(l => l.userId === interaction.user.id && l.product === name);
+    const { data: purchased } = await supabase
+      .from('purchase_logs')
+      .select('id')
+      .eq('discord_user_id', interaction.user.id)
+      .eq('product_name', name)
+      .maybeSingle();
+
     if (!purchased) {
-      return interaction.editReply({ content: '❌ You can only review products you\'ve purchased.' });
+      return interaction.editReply({ content: 'You can only review products you\'ve purchased.' });
     }
 
-    if (!reviews[name]) reviews[name] = [];
-    const alreadyReviewed = reviews[name].find(r => r.userId === interaction.user.id);
-    if (alreadyReviewed) {
-      return interaction.editReply({ content: '❌ You already reviewed this product.' });
+    const { data: userData } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', interaction.user.id)
+      .maybeSingle();
+
+    const { error: reviewError } = await supabase
+      .from('reviews')
+      .insert({
+        product_name: name,
+        discord_user_id: interaction.user.id,
+        discord_username: interaction.user.username,
+        roblox_username: userData?.roblox_username || 'Unknown',
+        roblox_id: userData?.roblox_id || 'Unknown',
+        stars,
+        feedback
+      });
+
+    if (reviewError) {
+      if (reviewError.code === '23505') {
+        return interaction.editReply({ content: 'You already reviewed this product.' });
+      }
+      console.error('Supabase error (review):', reviewError);
+      return interaction.editReply({ content: 'An error occurred. Please try again.' });
     }
 
-    const userData = users[interaction.user.id];
-    const avatar   = userData?.roblox?.id ? await getRobloxAvatar(userData.roblox.id) : null;
-
-    reviews[name].push({
-      userId: interaction.user.id,
-      userTag: interaction.user.username,
-      robloxUsername: userData?.roblox?.username || 'Unknown',
-      robloxId: userData?.roblox?.id || 'Unknown',
-      stars,
-      feedback,
-      reviewedAt: new Date().toISOString()
-    });
-    writeJSON(REVIEWS_F, reviews);
+    const avatar = userData?.roblox_id ? await getRobloxAvatar(userData.roblox_id) : null;
 
     // Post review publicly in review channel
     const reviewChannel = interaction.guild.channels.cache.get(REVIEW_CHANNEL);
@@ -561,7 +615,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTitle('New Product Review')
         .addFields(
           { name: 'Product Name', value: name },
-          { name: 'Roblox', value: `${userData?.roblox?.username || 'Unknown'}\n${userData?.roblox?.id || 'Unknown'}` },
+          { name: 'Roblox', value: `${userData?.roblox_username || 'Unknown'}\n${userData?.roblox_id || 'Unknown'}` },
           { name: 'Discord', value: `${interaction.user.username}\n${interaction.user.id}` },
           { name: 'Star Rating', value: starDisplay(stars) },
           { name: 'Additional Feedback', value: `\`\`\`${feedback}\`\`\`` }
@@ -573,7 +627,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await reviewChannel.send({ embeds: [reviewEmbed] });
     }
 
-    await interaction.editReply({ content: `✅ Review submitted for **${name}**! Thank you.` });
+    await interaction.editReply({ content: `Review submitted for **${name}**! Thank you.` });
   }
 
   // ── /buylogs ──────────────────────────────────────────────────────────────────
@@ -581,24 +635,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.deferReply({ ephemeral: true });
 
     const filter = interaction.options.getString('product')?.toLowerCase().trim();
-    let logs     = readJSON(LOGS_F);
 
-    if (filter) logs = logs.filter(l => l.product === filter);
+    let query = supabase
+      .from('purchase_logs')
+      .select('*')
+      .order('purchased_at', { ascending: false })
+      .limit(20);
 
-    if (logs.length === 0) {
-      return interaction.editReply({ content: '📋 No purchase logs found.' });
+    if (filter) query = query.eq('product_name', filter);
+
+    const { data: logs } = await query;
+
+    if (!logs || logs.length === 0) {
+      return interaction.editReply({ content: 'No purchase logs found.' });
     }
 
-    const recent = logs.slice(-20).reverse();
-    const lines  = recent.map((l, i) =>
-      `**${i + 1}.** <@${l.userId}> (${l.robloxUsername}) — **${l.product}** — ${l.price} — <t:${Math.floor(new Date(l.purchasedAt).getTime() / 1000)}:R>`
+    const lines = logs.map((l, i) =>
+      `**${i + 1}.** <@${l.discord_user_id}> (${l.roblox_username}) — **${l.product_name}** — ${l.price} — <t:${Math.floor(new Date(l.purchased_at).getTime() / 1000)}:R>`
     ).join('\n');
 
     const embed = new EmbedBuilder()
       .setColor(COLOR)
-      .setTitle(`📋 Purchase Logs${filter ? ` — ${filter}` : ''}`)
+      .setTitle(`Purchase Logs${filter ? ` — ${filter}` : ''}`)
       .setDescription(lines)
-      .setFooter({ text: `Showing last ${recent.length} of ${logs.length} total purchases` });
+      .setFooter({ text: `Showing last ${logs.length} purchases` });
 
     await interaction.editReply({ embeds: [embed] });
   }
@@ -607,29 +667,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (commandName === 'profile') {
     await interaction.deferReply({ ephemeral: true });
 
-    const users    = readJSON(USERS_F);
-    const logs     = readJSON(LOGS_F);
-    const userData = users[interaction.user.id];
+    const { data: userData } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', interaction.user.id)
+      .maybeSingle();
 
-    if (!userData?.roblox) {
+    if (!userData?.roblox_id) {
       return interaction.editReply({
-        content: '❌ You haven\'t linked your Roblox account yet. Use `/linkroblox` to get started.'
+        content: 'You haven\'t linked your Roblox account yet. Use `/linkroblox` to get started.'
       });
     }
 
-    const purchases = logs.filter(l => l.userId === interaction.user.id);
-    const avatar    = await getRobloxAvatar(userData.roblox.id);
+    const { data: purchases } = await supabase
+      .from('purchase_logs')
+      .select('product_name, price')
+      .eq('discord_user_id', interaction.user.id);
+
+    const purchaseList = purchases || [];
+    const avatar = await getRobloxAvatar(userData.roblox_id);
 
     const embed = new EmbedBuilder()
       .setColor(COLOR)
       .setTitle(`${interaction.user.username}'s Profile`)
       .addFields(
         { name: 'Discord', value: `<@${interaction.user.id}>`, inline: true },
-        { name: 'Roblox', value: `[${userData.roblox.username}](https://www.roblox.com/users/${userData.roblox.id}/profile)`, inline: true },
-        { name: 'Total Purchases', value: `${purchases.length}`, inline: true },
+        { name: 'Roblox', value: `[${userData.roblox_username}](https://www.roblox.com/users/${userData.roblox_id}/profile)`, inline: true },
+        { name: 'Total Purchases', value: `${purchaseList.length}`, inline: true },
         {
           name: 'Purchased Products',
-          value: purchases.length ? purchases.map(p => `• ${p.product}`).join('\n') : 'None yet'
+          value: purchaseList.length ? purchaseList.map(p => `• ${p.product_name}`).join('\n') : 'None yet'
         }
       );
 
@@ -640,5 +707,5 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 });
 
-// ✅ Login
+// Login
 client.login(process.env.TOKEN);
